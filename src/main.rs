@@ -1,10 +1,11 @@
 use std::{
-    env, io,
-    os::unix::process::{CommandExt, ExitStatusExt},
+    env,
+    os::unix::process::CommandExt,
     process::{exit, Command},
 };
 
 use nix::{
+    libc,
     sys::{
         ptrace,
         signal::Signal,
@@ -13,7 +14,11 @@ use nix::{
     unistd::Pid,
 };
 
-fn main() {
+#[cfg(target_arch = "x86_64")]
+
+use syscalls::Sysno;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -37,116 +42,223 @@ fn main() {
     unsafe {
         // This runs after fork() but before exec() in Unix terms.
         cmd.pre_exec(|| {
-            println!("[Child] Executing PTRACE_TRACME...");
-            // Note that pre_exec requires an unsafe block because it runs in a context where many standard library functions (like memory allocation) are unsafe to call. However, ptrace::traceme itself is generally safe here.
-            match ptrace::traceme() {
-                Ok(()) => {
-                    println!("[Child] PTRACE_TRACEME successful");
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("[Child] PTRACE_TRACEME failed: {}", e);
-                    Err(io::Error::new(io::ErrorKind::Other, e))
-                }
-            }
+            ptrace::traceme().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         });
     }
 
     // Spawn the child process
     // `spawn()` starts the child but doesn't wait for it yet.
     // It returns a Result<Child, io::Error>.
-    let child_result = cmd.spawn();
+    let mut child = cmd.spawn().expect("Failed to spawn child.");
+    let child_pid = Pid::from_raw(child.id() as i32);
 
-    match child_result {
-        Ok(mut child) => {
-            let child_pid = Pid::from_raw(child.id() as i32);
-            println!("---> Spawned child process with PID: {}", child_pid);
+    eprintln!("---> Spawned child with PID: {}", child_pid);
 
-            // Wait for the child to stop due to PTRACE_TRACEME
-            println!("[Parent] Waiting for child {} to signal...", child_pid);
-            match waitpid(Some(child_pid), None) {
-                // None options = wait for any state change
-                Ok(WaitStatus::Stopped(pid, Signal::SIGTRAP)) => {
-                    // This is the expected stop after PTRACE_TRACEME + execve
-                    println!(
-                        "[Parent] Received initial SIGTRAP from child {}. Attaching successful",
-                        pid
-                    );
-                }
-                Ok(WaitStatus::Exited(pid, status)) => {
-                    eprintln!(
-                        "[Parent] Child {} exited ({}) unexpectedly during PTRACE_TRACEME setup.",
-                        pid, status
-                    );
-                    exit(1);
-                }
-                Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                    eprintln!("[Parent] Child {} terminated by signal ({}) unexpectedly during PTRACE_TRACEME setup.", pid, signal);
-                    exit(1);
-                }
-                Ok(other_status) => {
-                    eprintln!(
-                        "[Parent] Unexpected wait status from child {}: {:?}",
-                        child_pid, other_status
-                    );
-                    let _ = child.kill();
-                    exit(1);
-                }
-                Err(e) => {
-                    eprintln!("[Parent] error waiting for child {}: {}", child_pid, e);
-                    let _ = child.kill();
-                    exit(1);
-                }
-            }
-
-            // Tell the child to continue (it's currently stopped)
-            println!("[Parent] Resuming child process {}...", child_pid);
-            if let Err(e) = ptrace::cont(child_pid, None) {
-                // None signal = don't inject a signal
-                eprintln!("[Parent] Failed to continue child {}: {}", child_pid, e);
-                let _ = child.kill();
-                exit(1);
-            }
-
-            // Wait for the child process to actually finish execution
-            // `wait()` blocks the current (parent) process until the child finishes.
-            // It returns a Result<ExitStatus, io::Error>.
-            println!("[Parent] Waiting for child {} to terminate...", child_pid);
-            match child.wait() {
-                Ok(exit_status) => {
-                    println!("---> Child process finished.");
-                    if exit_status.success() {
-                        println!("---> Child exit status: Success ({})", exit_status);
-                        exit(exit_status.code().unwrap_or(0));
-                    } else {
-                        // Check if it exited due to a signal (Unix-specific)
-                        if let Some(signal) = exit_status.signal() {
-                            eprintln!(
-                                "---> Child exit status: Terminated by signal {} ({})",
-                                signal, exit_status
-                            );
-                            /*
-                            Why 128 + signal?
-                                In Unix, exit codes are 8-bit values (0-255).
-
-                                By convention, 128 + signal_number is used to indicate that a process died due to a signal. This helps distinguish between normal exits (0-127) and signal-induced exits (129-255).
-                             */
-                            exit(128 + signal);
-                        } else {
-                            eprintln!("---> Child exit status: Failure ({})", exit_status);
-                            exit(exit_status.code().unwrap_or(1));
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error waiting for child process {}: {}", child.id(), e);
-                    exit(1);
-                }
-            }
+    match waitpid(Some(child_pid), None) {
+        // None options = wait for any state change
+        Ok(WaitStatus::Stopped(pid, Signal::SIGTRAP)) => {
+            // This is the expected stop after PTRACE_TRACEME + execve
+            eprintln!(
+                "---> Child {} stopped for initial trace setup. Setting options...",
+                pid
+            );
+            // PTRACE_O_TRACESYSGOOD makes syscalls traps deliver (SIGTRAP | 0x80)
+            ptrace::setoptions(pid, ptrace::Options::PTRACE_O_TRACESYSGOOD)?;
+            eprintln!("---> Options set. Continuing child...");
+        }
+        Ok(status) => {
+            eprintln!(
+                "!!! Initial waitpid failed: Expected SIGTRAP, got {:?}",
+                status
+            );
+            let _ = child.kill();
+            exit(1);
         }
         Err(e) => {
-            eprintln!("Error spawning executable '{}': {}", target_executable, e);
+            eprintln!("!!! Initial waitpid failed. {}", e);
+            let _ = child.kill();
             exit(1);
         }
     }
+
+    // Main tracing loop
+
+    let mut is_entering_syscall = true; // Flag to track entry/exit
+    loop {
+        // Tell the kernel to continue the child but stop at the next syscall entry or exit
+        if let Err(e) = ptrace::syscall(child_pid, None) {
+            eprintln!("!!! ptrace::syscall failed: {}", e);
+            // Check if the process still exists
+            if let nix::errno::Errno::ESRCH = e {
+                // ESRCH stands for "No such process."
+                eprintln!("---> Child process {} seems to have exited.", child_pid);
+                break;
+            }
+            let _ = child.kill();
+            return Err(e.into()); // Error propagation
+        }
+
+        // Wait for the child to stop again
+        let wait_status = match waitpid(child_pid, None) {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!("!!! waitpid failed during loop: {}", e);
+                if let nix::errno::Errno::ESRCH = e {
+                    eprintln!("---> Child process {} seems to have exited.", child_pid);
+                    break;
+                }
+                let _ = child.kill();
+                return Err(e.into());
+            }
+        };
+
+        match wait_status {
+            // Did the child exit?
+            WaitStatus::Exited(pid, status) => {
+                eprintln!("---> Child {} exited with status {}", pid, status);
+                break;
+            }
+            // Was the child terminated by a signal?
+            WaitStatus::Signaled(pid, signal, core_dumped) => {
+                eprintln!(
+                    "---> Child {} terminated by signal {} (core_dumped={})",
+                    pid, signal, core_dumped
+                );
+                break;
+            }
+            // Stopped due to a signal
+            WaitStatus::Stopped(pid, signal) => {
+                // Checking if it's the specific signbal generated by PTRACE_O_TRACESYSGOOD
+                let is_syscall_trap = signal as i32 == (libc::SIGTRAP | 0x80);
+
+                if is_syscall_trap {
+                    // It's a syscall entry or exit stop
+                    #[cfg(target_arch = "x86_64")] // Only compile this block for x86_64
+                    {
+                        // Get the register values
+                        match ptrace::getregs(pid) {
+                            Ok(regs) => {
+                                if is_entering_syscall {
+                                    // syscall entry
+                                    // syscall number is in orig_rax on x86_64
+                                    let syscall_no = regs.orig_rax as usize; // Convert to usize first
+                                    if let Some(syscall) = Sysno::new(syscall_no) {
+                                        eprintln!("[PID {}] > SYSCALL ENTRY: {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})", 
+                                            pid, 
+                                            syscall.name(),  // Now we can call name() on the unwrapped Sysno
+                                            regs.rdi, 
+                                            regs.rsi, 
+                                            regs.rdx, 
+                                            regs.r10, 
+                                            regs.r8, 
+                                            regs.r9
+                                        );
+                                    } else {
+                                        eprintln!("[PID {}] > SYSCALL ENTRY: UNKNOWN({})({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})", 
+                                            pid, 
+                                            syscall_no,  // Print the raw syscall number if unknown
+                                            regs.rdi, 
+                                            regs.rsi, 
+                                            regs.rdx, 
+                                            regs.r10, 
+                                            regs.r8, 
+                                            regs.r9
+                                        );
+                                    }
+                                } else {
+                                    // syscall exit
+                                    let ret_val = regs.rax;
+                                    eprintln!(
+                                        "[PID {} < SYSCALL EXIT: returning {:#x} ({})]",
+                                        pid, ret_val, ret_val as i64
+                                    );
+                                }
+                                is_entering_syscall = !is_entering_syscall;
+                            }
+                            Err(e) => {
+                                eprintln!("!!! ptrace: getregs failed: {}", e);
+                                if let nix::errno::Errno::ESRCH = e {
+                                    eprintln!("---> Child process {} seems to have exited during getregs.", pid);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        eprintln!("[PID {}] Syscall trap on unsupported architechture", pid);
+                        is_entering_syscall = !is_entering_syscall;
+                    }
+                } else {
+                    eprintln!("[PID {}] Stopped by signal: {}", pid, signal);
+                }
+            }
+            // Handle PtraceSyscall status
+            WaitStatus::PtraceSyscall(pid) => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    match ptrace::getregs(pid) {
+                        Ok(regs) => {
+                            if is_entering_syscall {
+                                let syscall_no = regs.orig_rax as usize;
+                                if let Some(syscall) = Sysno::new(syscall_no) {
+                                    eprintln!("[PID {}] > SYSCALL ENTRY: {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})", 
+                                        pid, 
+                                        syscall.name(),
+                                        regs.rdi, 
+                                        regs.rsi, 
+                                        regs.rdx, 
+                                        regs.r10, 
+                                        regs.r8, 
+                                        regs.r9
+                                    );
+                                } else {
+                                    eprintln!("[PID {}] > SYSCALL ENTRY: UNKNOWN({})({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x})", 
+                                        pid, 
+                                        syscall_no,
+                                        regs.rdi, 
+                                        regs.rsi, 
+                                        regs.rdx, 
+                                        regs.r10, 
+                                        regs.r8, 
+                                        regs.r9
+                                    );
+                                }
+                            } else {
+                                let ret_val = regs.rax;
+                                eprintln!(
+                                    "[PID {} < SYSCALL EXIT: returning {:#x} ({})]",
+                                    pid, ret_val, ret_val as i64
+                                );
+                            }
+                            is_entering_syscall = !is_entering_syscall;
+                        }
+                        Err(e) => {
+                            eprintln!("!!! ptrace: getregs failed: {}", e);
+                            if let nix::errno::Errno::ESRCH = e {
+                                eprintln!("---> Child process {} seems to have exited during getregs.", pid);
+                                break;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    eprintln!("[PID {}] Syscall trap on unsupported architecture", pid);
+                    is_entering_syscall = !is_entering_syscall;
+                }
+            }
+
+            other_status => {
+                eprintln!(
+                    "[PID {}] Unexpected wait status: {:?}",
+                    child_pid, other_status
+                );
+            }
+        }
+    }
+
+    eprintln!("---> Tracing finished.");
+    Ok(())
 }
